@@ -135,7 +135,7 @@ if __name__ == '__main__':
         enh_path = join(args.enhanced_dir, filename)
         if not os.path.isfile(enh_path):
             continue  # subset run: only score files that were actually enhanced
-        if 'dB' in filename:
+        if 'dB' in filename and not os.path.isfile(join(args.clean_dir, filename)):
             clean_filename = filename.split("_")[0] + ".wav"
         else:
             clean_filename = filename
