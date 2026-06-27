@@ -779,6 +779,11 @@ if __name__ == '__main__':
     parser.add_argument("--t_eps", type=float, default=0.03, help="The minimum process time (0.03 by default)")
     parser.add_argument("--gate_calibration", action="store_true", help="Collect speech gate scores for calibration")
     parser.add_argument("--gate_seed", type=int, default=0, help="Base random seed for reproducible gated sampling")
+    parser.add_argument("--gate_seed_no_offset", action="store_true",
+                        help="Use gate_seed directly for all utterances (no per-utterance 1000*utt_idx offset). "
+                             "Required when comparing SPP scores against oracle debug runs, which use fixed seeds 0..K-1 "
+                             "for all files. Without this flag, each file gets a different base seed "
+                             "(gate_seed + 1000*utt_idx), making SPP scores and oracle SI-SDR misaligned.")
     parser.add_argument("--gate_tau_path", type=str, default=None, help="Path to _calib_tau.json; enables per-step running-max rejection + restart")
     parser.add_argument("--gate_max_restarts", type=int, default=10, help="Max restarts per utterance when per-step gate triggers (used with --gate_tau_path)")
     parser.add_argument("--gate_compute_tau", action="store_true", help="Log per-step scores so G = max_k g_k; enables conformal tau calibration from gate_traj_logs")
@@ -1220,7 +1225,7 @@ if __name__ == '__main__':
                 with _torch.no_grad():
                     _spp_out = _spp_paul_model({"input": _y_in})
                 _lg_cache["spp_paul_spp"] = _spp_out["spp_estimate"].squeeze(0).cpu().numpy()  # [F_spp, T_spp]
-            _lg_base_seed = (args.gate_seed + 1000 * _utt_idx) if args.gate_seed is not None else None
+            _lg_base_seed = (args.gate_seed if args.gate_seed_no_offset else args.gate_seed + 1000 * _utt_idx) if args.gate_seed is not None else None
             (x_hat,
              _lg_scores,
              _lg_chosen_try,
@@ -1282,7 +1287,7 @@ if __name__ == '__main__':
             # Per-utterance base seed: deterministic from gate_seed + utterance index.
             # Each try j within this utterance uses base_seed + j, keeping tries independent.
             # If gate_seed is None, stochastic (non-reproducible) mode is used.
-            _ak_base_seed = (args.gate_seed + 1000 * _utt_idx) if args.gate_seed is not None else None
+            _ak_base_seed = (args.gate_seed if args.gate_seed_no_offset else args.gate_seed + 1000 * _utt_idx) if args.gate_seed is not None else None
             (x_hat,
              _ak_chosen_k,
              _ak_chosen_try,
@@ -1323,7 +1328,7 @@ if __name__ == '__main__':
 
         if args.policy == "adaptive_k_multilevel":
             y_np = y.squeeze().cpu().numpy()
-            _ak_base_seed = (args.gate_seed + 1000 * _utt_idx) if args.gate_seed is not None else None
+            _ak_base_seed = (args.gate_seed if args.gate_seed_no_offset else args.gate_seed + 1000 * _utt_idx) if args.gate_seed is not None else None
             (x_hat,
              _ak_chosen_k,
              _ak_chosen_try,
@@ -1364,7 +1369,7 @@ if __name__ == '__main__':
             continue
 
         if args.policy == "crc_adaptive":
-            _crc_base_seed = (args.gate_seed + 1000 * _utt_idx) if args.gate_seed is not None else None
+            _crc_base_seed = (args.gate_seed if args.gate_seed_no_offset else args.gate_seed + 1000 * _utt_idx) if args.gate_seed is not None else None
             _crc_yf_power = (Y[0].abs() ** 2).sum(dim=(0, 1)).detach().cpu().numpy()
             _crc_cache = {
                 "speech_mask_frames": _crc_yf_power > np.percentile(_crc_yf_power, 80),
