@@ -26,6 +26,7 @@ ms_snsd_libri_lowsnr/
 ms_snsd_libri_nonstat_m3063/
 libri-wham-focus/
 libri-chime-focus/
+crc_results/
 
 ### Emacs ###
 # -*- mode: gitignore; -*-
