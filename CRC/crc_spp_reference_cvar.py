@@ -371,17 +371,28 @@ def calibrate_tau_crc_cvar(
     CVaR finite-sample upper confidence bound (see cvar_crc.compute_cvar):
         CVaR_delta^+(τ) = min_t  t + 1/((1-delta)*(n+1)) * ( max(0, B-t) + sum_i max(0, L_i(τ)-t) )
 
-    Calibration rule:
-        tau_star = argmin_{τ} mean_attempts_cal(τ)   s.t.  CVaR_delta^+(τ) ≤ epsilon
+    Monotonization (Appendix A of the CRC paper, "Monotonizing non-monotone
+    risks" -- see cvar_crc.calibrate_cvar_tau for the full argument): our
+    adaptive-stopping loss need not be monotone in τ, so the raw per-τ
+    CVaR_delta^+(τ) need not be either. Calibration is therefore done against
+    its monotone upper envelope, C_mono(τ) = sup_{t>=τ} CVaR_delta^+(t),
+    computed as a reverse cumulative maximum over the (ascending) tau_grid.
 
-    Among feasible τ (CVaR_delta^+(τ) ≤ epsilon), pick smallest mean_attempts_cal;
-    ties broken by lowest CVaR_delta^+(τ).  If none feasible, pick min CVaR_delta^+(τ).
+    Calibration rule:
+        tau_star = argmin_{τ} mean_attempts_cal(τ)   s.t.  C_mono(τ) ≤ epsilon
+
+    Among feasible τ (C_mono(τ) ≤ epsilon), pick smallest mean_attempts_cal;
+    ties broken by lowest C_mono(τ).  If none feasible, pick min C_mono(τ).
 
     Returns
     -------
     tau_star   : selected threshold
-    cvar_star  : CVaR_delta^+(tau_star), the calibrated upper confidence bound
-    sweep_df   : per-tau calibration stats (column "cvar_hat" = CVaR_delta^+(τ))
+    cvar_star  : C_mono(tau_star), the calibrated (monotonized) upper
+                 confidence bound
+    sweep_df   : per-tau calibration stats -- columns "cvar_hat_raw"
+                 (CVaR_delta^+(τ), diagnostic only), "cvar_hat_monotonized"
+                 (C_mono(τ), the quantity actually calibrated against), and
+                 "monotonization_gap" (their difference, >= 0)
     """
     n              = scores_matrix.shape[0]
     best_score_idx = np.nanargmax(scores_matrix, axis=1)
@@ -754,11 +765,14 @@ def run_splits(
         sweep_all
         .groupby("tau", sort=True)
         .agg(
-            mean_cvar_hat      =("cvar_hat",          "mean"),
-            std_cvar_hat       =("cvar_hat",          "std"),
-            mean_t_star        =("t_star",            "mean"),
-            mean_attempts_cal  =("mean_attempts_cal", "mean"),
-            feasible_frac      =("feasible",          "mean"),
+            mean_cvar_hat_raw          =("cvar_hat_raw",          "mean"),
+            std_cvar_hat_raw           =("cvar_hat_raw",          "std"),
+            mean_cvar_hat_monotonized  =("cvar_hat_monotonized",  "mean"),
+            std_cvar_hat_monotonized   =("cvar_hat_monotonized",  "std"),
+            mean_monotonization_gap    =("monotonization_gap",    "mean"),
+            mean_t_star                =("t_star",                "mean"),
+            mean_attempts_cal          =("mean_attempts_cal",     "mean"),
+            feasible_frac              =("feasible",              "mean"),
         )
         .reset_index()
     )
@@ -876,23 +890,34 @@ def plot_attempts_vs_risk(splits_df: pd.DataFrame, out_path: str, epsilon: float
 
 
 def plot_tau_sweep(tau_sweep_df: pd.DataFrame, out_path: str, epsilon: float, delta: float) -> None:
-    color_cvar, color_attempts = "tab:blue", "tab:orange"
+    """
+    Plots both the raw per-tau CVaR_delta^+(tau) and its Appendix-A
+    monotonization C_mono(tau) = sup_{t>=tau} CVaR_delta^+(t) (reverse
+    cumulative max over tau). Feasibility/calibration uses C_mono, so it is
+    the curve that should be compared against the alpha line; C_mono lies on
+    or above the raw curve everywhere by construction.
+    """
+    color_raw, color_mono, color_attempts = "tab:gray", "tab:blue", "tab:orange"
 
     fig, ax1 = plt.subplots(figsize=(6, 4))
 
-    ax1.plot(tau_sweep_df["tau"], tau_sweep_df["mean_cvar_hat"],
-             marker="o", markersize=3, color=color_cvar, label="CVaR_hat (calib, mean ± std)")
+    ax1.plot(tau_sweep_df["tau"], tau_sweep_df["mean_cvar_hat_raw"],
+             marker=".", markersize=3, linestyle=":", color=color_raw,
+             label="CVaR_hat raw (calib, mean)")
+    ax1.plot(tau_sweep_df["tau"], tau_sweep_df["mean_cvar_hat_monotonized"],
+             marker="o", markersize=3, color=color_mono,
+             label="CVaR_hat monotonized (calib, mean ± std)")
     ax1.fill_between(
         tau_sweep_df["tau"],
-        tau_sweep_df["mean_cvar_hat"] - tau_sweep_df["std_cvar_hat"],
-        tau_sweep_df["mean_cvar_hat"] + tau_sweep_df["std_cvar_hat"],
-        alpha=0.2, color=color_cvar,
+        tau_sweep_df["mean_cvar_hat_monotonized"] - tau_sweep_df["std_cvar_hat_monotonized"],
+        tau_sweep_df["mean_cvar_hat_monotonized"] + tau_sweep_df["std_cvar_hat_monotonized"],
+        alpha=0.2, color=color_mono,
     )
     ax1.axhline(epsilon, color="red", linestyle="--", linewidth=1,
                 label=f"$\\alpha$={epsilon}")
     ax1.set_xlabel("tau")
-    ax1.set_ylabel("CVaR_hat of SPP-reference risk (calib)", color=color_cvar)
-    ax1.tick_params(axis="y", labelcolor=color_cvar)
+    ax1.set_ylabel("CVaR_hat of SPP-reference risk (calib)", color=color_mono)
+    ax1.tick_params(axis="y", labelcolor=color_mono)
 
     ax2 = ax1.twinx()
     ax2.plot(tau_sweep_df["tau"], tau_sweep_df["mean_attempts_cal"],

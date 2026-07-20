@@ -45,6 +45,22 @@ This is exactly the `h <= alpha` constraint solved jointly over (lambda, t)
 in StorageProblemLambdaParameterized -- here `t` is still searched over, but
 `lambda` (the battery-specific decision-scaling variable) has no counterpart
 in our setting; its role is played by `tau`, which is swept externally.
+
+Monotonization (Appendix A of the CRC paper, "Monotonizing non-monotone
+risks"): the CRC feasibility search ("smallest/most-permissive feasible tau")
+implicitly assumes risk is monotone non-decreasing in tau. Our adaptive-
+stopping loss has no such guarantee -- later diffusion samples are not
+guaranteed to have better SI-SDR than earlier ones -- so the raw, per-tau
+CVaR_delta^+(tau) computed independently at each grid point can be non-
+monotone too. Appendix A's fix is to calibrate against the monotone upper
+envelope of the empirical risk instead of the raw statistic:
+
+    C_mono(tau) = sup_{t >= tau} C(t)
+
+On a discrete, ascending tau grid this is exactly a reverse cumulative
+maximum: C_mono(tau_i) = max_{j >= i} C(tau_j). See `calibrate_cvar_tau`,
+which computes both the raw and monotonized statistics and calibrates
+against the monotonized one.
 """
 
 from typing import Callable, Optional
@@ -161,12 +177,29 @@ def calibrate_cvar_tau(
     calibration ("CORC" / CVaR-CRC):
 
         tau_cal = argmin_{tau in tau_grid} mean_attempts(tau)
-                  s.t. CVaR_delta^+(tau) <= alpha
+                  s.t. C_mono(tau) <= alpha
 
     Mirrors `calibrate_tau_crc` in crc_spp_reference.py exactly, except the
     risk functional feeding the feasibility check is the finite-sample CVaR
     upper confidence bound CVaR_delta^+(tau) (`compute_cvar`) instead of the
     mean-based corrected risk n/(n+1)*Rhat + 1/(n+1).
+
+    Monotonization (Appendix A, "Monotonizing non-monotone risks" -- see the
+    module docstring for the full argument): our adaptive-stopping loss is
+    not guaranteed to be monotone in tau, so the raw per-tau statistic
+    CVaR_delta^+(tau) is not guaranteed to be monotone in tau either, even
+    though the feasibility search ("smallest feasible tau") implicitly
+    assumes it is. Appendix A fixes this by calibrating against the monotone
+    upper envelope of the raw statistic instead of the raw statistic itself:
+
+        C_mono(tau) = sup_{t >= tau} C(t)
+
+    which on our discrete, ascending tau_grid is exactly a *reverse*
+    cumulative maximum: C_mono(tau_i) = max_{j >= i} C(tau_j). C_mono is a
+    pointwise upper bound on the raw statistic (C_mono >= C everywhere) and
+    is monotone non-increasing as tau increases. Feasibility and the
+    tie-break below are computed from C_mono, not the raw statistic; the raw
+    statistic is retained in `rows` for diagnostics only.
 
     Args:
         tau_grid: candidate thresholds to sweep, ascending
@@ -176,39 +209,68 @@ def calibrate_cvar_tau(
                   attempts at this tau (used only for tie-breaking /
                   selection among feasible tau, exactly as in the mean-risk
                   version -- not part of the CVaR computation itself)
-        alpha:    risk threshold; tau is "feasible" when CVaR_delta^+(tau) <= alpha
+        alpha:    risk threshold; tau is "feasible" when C_mono(tau) <= alpha
         delta:    CVaR quantile level
         B:        essential upper bound of the per-example loss
 
     Returns:
         tau_star  : selected threshold
-        cvar_star : CVaR_delta^+(tau_star), the calibrated upper confidence bound
+        cvar_star : C_mono(tau_star), the calibrated (monotonized) upper
+                    confidence bound used for feasibility
         rows      : list of per-tau dicts with keys
-                    tau, mean_loss_cal, cvar_hat, t_star, mean_attempts_cal, feasible
-                    (cvar_hat in each row is CVaR_delta^+(tau) for that tau)
+                    tau, mean_loss_cal, cvar_hat_raw, cvar_hat_monotonized,
+                    monotonization_gap, t_star, mean_attempts_cal, feasible
+                    (cvar_hat_raw is CVaR_delta^+(tau) computed independently
+                    at that tau -- i.e. what this function returned as
+                    "cvar_hat" before monotonization was added;
+                    cvar_hat_monotonized is C_mono(tau); monotonization_gap
+                    is their difference (>= 0); feasible is decided from
+                    cvar_hat_monotonized)
     """
+    # --- STEP 1: sweep tau, stash the raw per-tau CVaR statistic only. Do
+    # NOT decide feasibility yet -- it depends on the monotonized curve,
+    # which needs every tau's raw statistic to be computed first. ---
     rows = []
     for tau in tau_grid:
         losses, mean_attempts = loss_fn(tau)
-        cvar_hat, t_star = compute_cvar(losses, delta=delta, B=B)
+        cvar_hat_raw, t_star = compute_cvar(losses, delta=delta, B=B)
         rows.append({
             "tau":               float(tau),
             "mean_loss_cal":     float(np.mean(losses)),
-            "cvar_hat":          cvar_hat,
+            "cvar_hat_raw":      cvar_hat_raw,
             "t_star":            t_star,
             "mean_attempts_cal": float(mean_attempts),
-            "feasible":          bool(cvar_hat <= alpha),
         })
 
+    # --- STEP 2: monotonize (Appendix A) via a reverse cumulative maximum
+    # over the tau-sorted raw statistic. ---
+    rows.sort(key=lambda r: r["tau"])
+    raw  = np.asarray([row["cvar_hat_raw"] for row in rows], dtype=float)
+    mono = np.maximum.accumulate(raw[::-1])[::-1]
+
+    # --- STEP 3: attach the monotonized statistic and NOW decide
+    # feasibility, from the monotonized statistic (not the raw one). ---
+    for row, mono_value in zip(rows, mono):
+        row["cvar_hat_monotonized"] = float(mono_value)
+        row["monotonization_gap"]   = float(mono_value - row["cvar_hat_raw"])
+        row["feasible"]             = bool(mono_value <= alpha)
+
+    # --- STEP 4: selection among feasible tau is unchanged -- smallest
+    # mean_attempts_cal, ties broken by smallest CVaR -- except the
+    # criterion is now the monotonized CVaR, not the raw one. ---
     feasible_rows = [r for r in rows if r["feasible"]]
     if feasible_rows:
-        best = min(feasible_rows, key=lambda r: (r["mean_attempts_cal"], r["cvar_hat"]))
+        best = min(
+            feasible_rows,
+            key=lambda r: (r["mean_attempts_cal"], r["cvar_hat_monotonized"]),
+        )
     else:
-        # Guarantee unachievable: pick the tau that minimizes CVaR_hat; among
-        # those within 1e-3 of that minimum, prefer the largest mean_attempts_cal
-        # (mirrors calibrate_tau_crc's fallback exactly).
-        min_cvar = min(r["cvar_hat"] for r in rows)
-        near_min = [r for r in rows if r["cvar_hat"] <= min_cvar + 1e-3]
+        # Guarantee unachievable: pick the tau that minimizes
+        # cvar_hat_monotonized; among those within 1e-3 of that minimum,
+        # prefer the largest mean_attempts_cal (mirrors calibrate_tau_crc's
+        # fallback exactly).
+        min_cvar = min(r["cvar_hat_monotonized"] for r in rows)
+        near_min = [r for r in rows if r["cvar_hat_monotonized"] <= min_cvar + 1e-3]
         best = max(near_min, key=lambda r: r["mean_attempts_cal"])
 
-    return best["tau"], best["cvar_hat"], rows
+    return best["tau"], best["cvar_hat_monotonized"], rows
