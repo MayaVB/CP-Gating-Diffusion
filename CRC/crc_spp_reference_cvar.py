@@ -71,7 +71,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from cvar_crc import calibrate_cvar_tau, empirical_cvar
+from cvar_crc import calibrate_cvar_tau, empirical_cvar, fit_t_grid
 
 # ---------------------------------------------------------------------------
 # Column-name resolution  (identical to crc_spp_reference.py)
@@ -360,9 +360,18 @@ def calibrate_tau_crc_cvar(
     delta: float,
     loss_bound: float,
     risk_mode: str = "clipped",
+    t_grid: np.ndarray = None,
 ):
     """
     Sweep tau_grid on the calibration set and select tau via CVaR-CORC.
+
+    t_grid : optional (len(tau_grid),) array of FROZEN t values (see
+             fit_t_grid_from_training / cvar_crc.fit_t_grid). When given, t is
+             not re-optimized on this calibration set -- it's fixed at
+             t_grid[i] for tau_grid[i], keeping the calibration/test split
+             here statistically independent of whatever (possibly
+             non-exchangeable) data t was fit on. Default None reproduces
+             the original behavior exactly (t optimized jointly per split).
 
     Risk metric : SPP-reference loss (compute_sisdr_risk with m_ref = SPP-best SI-SDR).
     Reference   : m_ref = sisdr_matrix[n, argmax_k scores_matrix[n]]  (SPP-best).
@@ -405,10 +414,40 @@ def calibrate_tau_crc_cvar(
         return risk, float(attempts.mean())
 
     tau_star, cvar_star, rows = calibrate_cvar_tau(
-        tau_grid, loss_fn, alpha=epsilon, delta=delta, B=loss_bound
+        tau_grid, loss_fn, alpha=epsilon, delta=delta, B=loss_bound, t_grid=t_grid
     )
     sweep_df = pd.DataFrame(rows)
     return tau_star, cvar_star, sweep_df
+
+
+def fit_t_grid_from_training(
+    train_scores_matrix: np.ndarray,
+    train_sisdr_matrix: np.ndarray,
+    tau_grid: np.ndarray,
+    delta: float,
+    loss_bound: float,
+    risk_mode: str = "clipped",
+) -> np.ndarray:
+    """
+    Fit the frozen CVaR auxiliary variable t(tau) on a held-out TRAINING
+    split (e.g. VoiceBank-DEMAND train -- not exchangeable with the test
+    split: different speakers and SNR levels, see CLAUDE.md). Uses the same
+    SPP-reference loss functional as calibrate_tau_crc_cvar, but only solves
+    for t per tau here; tau itself is still calibrated later, on the
+    (exchangeable) test-split calib/test splits in run_splits, using this
+    frozen t_grid in place of a per-split t optimization.
+    """
+    n = train_scores_matrix.shape[0]
+    best_score_idx = np.nanargmax(train_scores_matrix, axis=1)
+    m_ref = train_sisdr_matrix[np.arange(n), best_score_idx]
+
+    def loss_fn(tau: float):
+        _, attempts, sel_idx, _ = select_by_tau(train_scores_matrix, tau)
+        m_tau = train_sisdr_matrix[np.arange(n), sel_idx]
+        risk  = compute_sisdr_risk(m_ref, m_tau, risk_mode=risk_mode)
+        return risk, float(attempts.mean())
+
+    return fit_t_grid(tau_grid, loss_fn, delta=delta, B=loss_bound)
 
 
 # ---------------------------------------------------------------------------
@@ -687,12 +726,18 @@ def run_splits(
     calib_frac: float,
     seed: int,
     risk_mode: str = "clipped",
+    t_grid: np.ndarray = None,
 ):
     """
     Run n_splits random calibration/test splits.
 
     CVaR-CORC calibration and test evaluation both use the SPP-reference loss.
     Selection is score-based throughout.
+
+    t_grid : optional frozen t(tau) array fit on a separate training split
+             (see fit_t_grid_from_training); passed straight through to
+             calibrate_tau_crc_cvar for every split. Default None reproduces
+             the original per-split t optimization exactly.
 
     Returns
     -------
@@ -722,7 +767,7 @@ def run_splits(
         # CVaR-CORC calibration: score-based selection, SPP-reference loss
         tau_star, cvar_star, sweep_df = calibrate_tau_crc_cvar(
             calib_scores, calib_sisdr, tau_grid, epsilon, delta, loss_bound,
-            risk_mode=risk_mode,
+            risk_mode=risk_mode, t_grid=t_grid,
         )
         # Same loss on test split
         test_stats = compute_sisdr_risk_stats(
@@ -796,14 +841,16 @@ def run_epsilon_sweep(
     calib_frac: float,
     seed: int,
     risk_mode: str = "clipped",
+    t_grid: np.ndarray = None,
 ):
     rows              = []
     all_sisdr_records = []
     sisdr_rows        = []
+    tau_sweep_df      = None  # captured once below -- doesn't depend on epsilon
 
     for epsilon in epsilons:
         print(f"\nEpsilon {epsilon}:")
-        splits_df, _, split_records = run_splits(
+        splits_df, split_tau_sweep_df, split_records = run_splits(
             scores_matrix, sisdr_matrix, utt_ids, tau_grid,
             epsilon=epsilon,
             delta=delta,
@@ -812,7 +859,10 @@ def run_epsilon_sweep(
             calib_frac=calib_frac,
             seed=seed,
             risk_mode=risk_mode,
+            t_grid=t_grid,
         )
+        if tau_sweep_df is None:
+            tau_sweep_df = split_tau_sweep_df
         rows.append({
             "epsilon":                            epsilon,
             "mean_selected_tau":                  splits_df["tau_star"].mean(),
@@ -859,7 +909,7 @@ def run_epsilon_sweep(
         print(f"  CRC gap (SPP-best − selected):      {splits_df['mean_crc_gap'].mean():.3f} dB")
         print(f"  oracle gap (oracle − SPP-best):     {splits_df['mean_oracle_gap'].mean():.3f} dB  [diagnostic]")
 
-    return pd.DataFrame(rows), all_sisdr_records, pd.DataFrame(sisdr_rows)
+    return pd.DataFrame(rows), all_sisdr_records, pd.DataFrame(sisdr_rows), tau_sweep_df
 
 
 # ---------------------------------------------------------------------------
@@ -889,76 +939,36 @@ def plot_attempts_vs_risk(splits_df: pd.DataFrame, out_path: str, epsilon: float
     plt.close(fig)
 
 
-def plot_tau_sweep(tau_sweep_df: pd.DataFrame, out_path: str, epsilon: float, delta: float) -> None:
+def plot_tau_sweep(tau_sweep_df: pd.DataFrame, out_path: str, delta: float) -> None:
     """
-    Plots both the raw per-tau CVaR_delta^+(tau) and its Appendix-A
-    monotonization C_mono(tau) = sup_{t>=tau} CVaR_delta^+(t) (reverse
-    cumulative max over tau). Feasibility/calibration uses C_mono, so it is
-    the curve that should be compared against the alpha line; C_mono lies on
-    or above the raw curve everywhere by construction.
+    Plots the Appendix-A monotonized CVaR, C_mono(tau) = sup_{t>=tau}
+    CVaR_delta^+(t) (reverse cumulative max over tau) -- the curve that
+    feasibility/calibration is actually computed against.
     """
-    color_raw, color_mono, color_attempts = "tab:gray", "tab:blue", "tab:orange"
+    color_mono, color_attempts = "tab:blue", "tab:orange"
 
-    fig, ax1 = plt.subplots(figsize=(6, 4))
+    fig, ax1 = plt.subplots(figsize=(5, 3.75))
 
-    ax1.plot(tau_sweep_df["tau"], tau_sweep_df["mean_cvar_hat_raw"],
-             marker=".", markersize=3, linestyle=":", color=color_raw,
-             label="CVaR_hat raw (calib, mean)")
     ax1.plot(tau_sweep_df["tau"], tau_sweep_df["mean_cvar_hat_monotonized"],
-             marker="o", markersize=3, color=color_mono,
-             label="CVaR_hat monotonized (calib, mean ± std)")
+             marker="o", markersize=3, color=color_mono)
     ax1.fill_between(
         tau_sweep_df["tau"],
         tau_sweep_df["mean_cvar_hat_monotonized"] - tau_sweep_df["std_cvar_hat_monotonized"],
         tau_sweep_df["mean_cvar_hat_monotonized"] + tau_sweep_df["std_cvar_hat_monotonized"],
         alpha=0.2, color=color_mono,
     )
-    ax1.axhline(epsilon, color="red", linestyle="--", linewidth=1,
-                label=f"$\\alpha$={epsilon}")
-    ax1.set_xlabel("tau")
-    ax1.set_ylabel("CVaR_hat of SPP-reference risk (calib)", color=color_mono)
-    ax1.tick_params(axis="y", labelcolor=color_mono)
+    ax1.set_xlabel(r"$\tau$ (threshold)", fontsize=11)
+    ax1.set_ylabel(r"Empirical CVaR$_\delta$", color=color_mono, fontsize=13)
+    ax1.tick_params(axis="y", labelcolor=color_mono, labelsize=9)
+    ax1.tick_params(axis="x", labelsize=9)
+    ax1.grid(True, alpha=0.3)
 
     ax2 = ax1.twinx()
     ax2.plot(tau_sweep_df["tau"], tau_sweep_df["mean_attempts_cal"],
-             marker="o", markersize=3, color=color_attempts, label="mean attempts (K)")
-    ax2.set_ylabel("Mean attempts (K)", color=color_attempts)
-    ax2.tick_params(axis="y", labelcolor=color_attempts)
+             marker="o", markersize=3, color=color_attempts)
+    ax2.set_ylabel("Average compute (K)", color=color_attempts, fontsize=13)
+    ax2.tick_params(axis="y", labelcolor=color_attempts, labelsize=9)
 
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="upper left")
-    ax1.set_title(f"CVaR-CORC ($\\delta$={delta}): risk and attempts vs tau")
-
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-
-
-def plot_epsilon_sweep(sweep_df: pd.DataFrame, out_path: str, delta: float, sisdr_df: pd.DataFrame = None) -> None:
-    if sisdr_df is None:
-        sisdr_df = sweep_df
-    fig, ax1 = plt.subplots(figsize=(6, 4))
-    color_sisdr, color_attempts = "tab:blue", "tab:orange"
-
-    ax1.plot(sisdr_df["epsilon"], sisdr_df["mean_sisdr_selected"],
-             marker="o", color=color_sisdr, label="CVaR-CORC selected SI-SDR")
-    ax1.axhline(sisdr_df["mean_sisdr_try1"].iloc[0], linestyle="--", color="grey",
-                linewidth=1, label="try-1 baseline")
-    ax1.set_xlabel("$\\alpha$ (risk level)")
-    ax1.set_ylabel("Mean SI-SDR (dB)", color=color_sisdr)
-    ax1.tick_params(axis="y", labelcolor=color_sisdr)
-
-    ax2 = ax1.twinx()
-    ax2.plot(sisdr_df["epsilon"], sisdr_df["mean_test_avg_attempts"],
-             marker="s", linestyle="--", color=color_attempts, label="avg attempts")
-    ax2.set_ylabel("Average attempts (test)", color=color_attempts)
-    ax2.tick_params(axis="y", labelcolor=color_attempts)
-
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="upper right")
-    ax1.set_title(f"CVaR-CORC ($\\delta$={delta}) epsilon sweep: SI-SDR vs attempts")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -981,127 +991,46 @@ def plot_epsilon_sweep_risk_vs_attempts(
     avgK      = sweep_df["mean_test_avg_attempts"].values
     eps_max   = float(eps.max())
 
-    fig, ax1 = plt.subplots(figsize=(6, 4))
+    fig, ax1 = plt.subplots(figsize=(5, 3.75))
     color_cvar, color_k = "tab:blue", "tab:orange"
 
     ax1.plot(eps, cvar, "o-", color=color_cvar, lw=2, ms=5,
-              label=f"Test empirical CVaR$_\\delta$ ({risk_mode})")
+              label="Empirical CVaR$_\\delta$")
     ax1.fill_between(eps, cvar - cvar_std, cvar + cvar_std, color=color_cvar, alpha=0.18)
     ax1.axhline(0, color="grey", lw=0.8, alpha=0.6)
 
     diag = np.linspace(0, eps_max * 1.05, 200)
-    ax1.plot(diag, diag, "k--", lw=1, alpha=0.45, label="CVaR = α")
+    ax1.plot(diag, diag, "k--", lw=1, alpha=0.45)
 
-    ax1.set_xlabel("α (CVaR budget)")
-    ax1.set_ylabel(f"Test empirical CVaR$_\\delta$ ({risk_mode})", color=color_cvar)
-    ax1.tick_params(axis="y", labelcolor=color_cvar)
+    ax1.set_xlabel("$\\alpha$ (risk level)", fontsize=11)
+    ax1.set_ylabel("Empirical CVaR$_\\delta$", color=color_cvar, fontsize=13)
+    ax1.tick_params(axis="y", labelcolor=color_cvar, labelsize=9)
+    ax1.tick_params(axis="x", labelsize=9)
     ax1.set_xlim(0, eps_max * 1.05)
 
     ax2 = ax1.twinx()
-    ax2.plot(eps, avgK, "s--", color=color_k, lw=2, ms=5, label="avg attempts")
-    ax2.set_ylabel("Average attempts (test)", color=color_k)
-    ax2.tick_params(axis="y", labelcolor=color_k)
+    ax2.plot(eps, avgK, "s--", color=color_k, lw=2, ms=5, label="$\\bar{K}$ (avg. attempts)")
+    ax2.set_ylabel("Average compute (K)", color=color_k, fontsize=13)
+    ax2.tick_params(axis="y", labelcolor=color_k, labelsize=9)
     ax2.set_ylim(bottom=0)
 
-    title = f"{dataset_label} — CVaR-CORC ($\\delta$={delta}) epsilon sweep:\n{risk_mode} CVaR$_\\delta$ vs attempts" \
-        if dataset_label else f"CVaR-CORC ($\\delta$={delta}) epsilon sweep:\n{risk_mode} CVaR$_\\delta$ vs attempts"
-    ax1.set_title(title, fontsize=11)
-
-    lines1, lab1 = ax1.get_legend_handles_labels()
-    lines2, lab2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, lab1 + lab2, fontsize=8, loc="upper left")
-
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
 
+    # Label the diagonal in-line, rotated to match its on-screen slope.
+    mid = eps_max * 0.6
+    p1  = ax1.transData.transform((0, 0))
+    p2  = ax1.transData.transform((eps_max, eps_max))
+    angle = np.degrees(np.arctan2(p2[1] - p1[1], p2[0] - p1[0]))
+    ax1.text(mid, mid, "Target: CVaR $=\\alpha$", rotation=angle, rotation_mode="anchor",
+             ha="center", va="bottom", fontsize=9, color="black", alpha=0.7)
 
-def plot_cvar_alpha_sweep(sweep_df: pd.DataFrame, out_path: str, delta: float) -> None:
-    """
-    CVaR analogue of the CRC epsilon-sweep plot (built from the
-    `..._epsilon_sweep.csv` output). Unlike plot_epsilon_sweep_risk_vs_attempts,
-    this does NOT plot mean_test_sisdr_risk anywhere -- that's diagnostic only
-    for CVaR-CORC, and the diagonal here compares alpha ONLY to the empirical
-    CVaR_delta, never to mean risk.
-
-    x-axis:        alpha (CVaR risk level)
-    left y-axis:   test empirical CVaR_delta (+/- std shaded band), blue
-    diagonal:      CVaR_delta = alpha, grey dashed
-    right y-axis:  average diffusion attempts K_bar (test), orange
-    """
-    alpha     = sweep_df["epsilon"].values
-    cvar      = sweep_df["mean_test_empirical_cvar_delta"].values
-    avgK      = sweep_df["mean_test_avg_attempts"].values
-    alpha_max = float(alpha.max())
-
-    fig, ax1 = plt.subplots(figsize=(6, 4))
-    color_cvar, color_k = "tab:blue", "tab:orange"
-
-    ax1.plot(alpha, cvar, "*--", color=color_cvar, lw=2, ms=8,
-              label="Test empirical CVaR$_\\delta$")
-    if "std_test_empirical_cvar_delta" in sweep_df.columns:
-        cvar_std = sweep_df["std_test_empirical_cvar_delta"].values
-        if np.all(np.isfinite(cvar_std)):
-            ax1.fill_between(alpha, cvar - cvar_std, cvar + cvar_std, color=color_cvar, alpha=0.18)
-
-    diag = np.linspace(0, alpha_max * 1.05, 200)
-    ax1.plot(diag, diag, "--", color="grey", lw=1, alpha=0.6)
-
-    ax1.set_xlabel("$\\alpha$ (CVaR risk level)")
-    ax1.set_ylabel("Test empirical CVaR$_\\delta$ of SPP-reference risk", color=color_cvar)
-    ax1.tick_params(axis="y", labelcolor=color_cvar)
-    ax1.set_xlim(0, alpha_max * 1.05)
-
-    ax2 = ax1.twinx()
-    ax2.plot(alpha, avgK, "s--", color=color_k, lw=2, ms=5,
-              label="Average attempts $\\bar{K}$")
-    ax2.set_ylabel("Average diffusion attempts $\\bar{K}$ (test)", color=color_k)
-    ax2.tick_params(axis="y", labelcolor=color_k)
-    ax2.set_ylim(bottom=0)
-
-    lines1, lab1 = ax1.get_legend_handles_labels()
-    lines2, lab2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, lab1 + lab2, fontsize=8, loc="upper left")
-
-    ax1.set_title(f"CVaR-CORC ($\\delta$={delta}): tail risk vs attempts")
-
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
 def make_sisdr_plots(sisdr_sweep_df: pd.DataFrame, plot_dir: str) -> None:
     x = sisdr_sweep_df["mean_test_avg_attempts"]
     os.makedirs(plot_dir, exist_ok=True)
-
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.plot(x, sisdr_sweep_df["mean_sisdr_selected"],  marker="o",             label="CVaR-CORC selected")
-    ax.plot(x, sisdr_sweep_df["mean_sisdr_try1"],      marker="s", linestyle="--", label="try-1 baseline")
-    ax.plot(x, sisdr_sweep_df["mean_sisdr_spp_best"],  marker="D", linestyle=":",  label="SPP-best (CRC ref)")
-    ax.plot(x, sisdr_sweep_df["mean_sisdr_oracle"],    marker="^", linestyle=":",  label="SI-SDR oracle [diag]")
-    ax.set_xlabel("Average attempts (test)")
-    ax.set_ylabel("SI-SDR (dB)")
-    ax.set_title("SI-SDR vs attempts  (epsilon sweep)")
-    ax.legend(fontsize=9)
-    fig.tight_layout()
-    fig.savefig(os.path.join(plot_dir, "sisdr_vs_attempts.png"), dpi=150)
-    plt.close(fig)
-
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.errorbar(x, sisdr_sweep_df["mean_crc_gap"], yerr=sisdr_sweep_df["std_crc_gap"],
-                marker="o", color="tab:blue", capsize=4,
-                label="CRC gap (SPP-best − selected)")
-    ax.errorbar(x, sisdr_sweep_df["mean_oracle_gap"], yerr=sisdr_sweep_df["std_oracle_gap"],
-                marker="s", linestyle="--", color="tab:red", capsize=4,
-                label="oracle gap (oracle − SPP-best) [diag]")
-    ax.axhline(0, color="grey", linestyle="--", linewidth=1)
-    ax.set_xlabel("Average attempts (test)")
-    ax.set_ylabel("SI-SDR gap (dB)")
-    ax.set_title("CVaR-CORC gap and oracle gap vs attempts")
-    ax.legend(fontsize=9)
-    fig.tight_layout()
-    fig.savefig(os.path.join(plot_dir, "crc_gap_vs_attempts.png"), dpi=150)
-    plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.errorbar(x, sisdr_sweep_df["mean_delta_try1"], yerr=sisdr_sweep_df["std_delta_try1"],
@@ -1168,6 +1097,19 @@ def parse_args():
                        "Required for CVaR-CORC calibration and evaluation. "
                        "Expected columns: file id, try index, sisdr."
                    ))
+    p.add_argument("--train_scores_csv", default=None,
+                   help=(
+                       "Optional: scores CSV from a SEPARATE training split (e.g. "
+                       "VB-DMD train, not exchangeable with --scores_csv's test split). "
+                       "When given together with --train_metrics_csv, the CVaR auxiliary "
+                       "variable t is fit ONCE on this training data (per tau, over the "
+                       "same tau grid) and then FROZEN for all calibration/test splits in "
+                       "--scores_csv/--metrics_csv -- only tau is calibrated there. "
+                       "Default (omitted): original behavior, t optimized jointly with "
+                       "each calibration split (backward compatible)."
+                   ))
+    p.add_argument("--train_metrics_csv", default=None,
+                   help="SI-SDR CSV matching --train_scores_csv. Required if --train_scores_csv is set.")
     p.add_argument("--epsilon",    type=float, default=0.10,
                    help="Risk threshold alpha: tau is feasible when CVaR_hat(tau) <= epsilon.")
     p.add_argument("--delta",      type=float, default=0.9,
@@ -1241,6 +1183,12 @@ def main():
         loss_bound = 1.0
     else:
         loss_bound = args.loss_bound
+
+    if (args.train_scores_csv is None) != (args.train_metrics_csv is None):
+        raise ValueError(
+            "--train_scores_csv and --train_metrics_csv must be given together "
+            "(or both omitted for the original behavior)."
+        )
 
     # --- Load scores ---
     print(f"Loading scores from {args.scores_csv} ...")
@@ -1335,6 +1283,47 @@ def main():
     tau_max  = args.tau_max  if args.tau_max  is not None else float(np.percentile(all_scores, 99))
     tau_grid = np.linspace(tau_min, tau_max, args.tau_steps)
 
+    # --- Optional: fit t once on a separate training split, then freeze it ---
+    t_grid = None
+    if args.train_scores_csv is not None:
+        print(f"\nLoading TRAINING scores from {args.train_scores_csv} ...")
+        train_df = load_scores(args.train_scores_csv)
+        _train_dups = train_df.duplicated(subset=["utt_id", "try_idx"], keep=False)
+        if _train_dups.any():
+            raise ValueError(
+                f"Training scores CSV contains {int(_train_dups.sum())} rows with "
+                f"duplicate (utt_id, try_idx)."
+            )
+        train_scores_matrix, train_utt_ids = pivot_scores_by_utterance(train_df, args.K)
+        print(f"  {len(train_df):,} rows | {len(train_utt_ids):,} utterances")
+
+        print(f"Loading TRAINING SI-SDR from {args.train_metrics_csv} ...")
+        train_mdf = load_metrics(args.train_metrics_csv)
+        validate_seed_alignment(train_df, train_mdf)
+        train_sisdr_matrix = pivot_metrics_by_utterance(train_mdf, args.K, train_utt_ids)
+
+        train_valid_mask = (
+            ~np.isnan(train_scores_matrix).any(axis=1)
+            & ~np.isnan(train_sisdr_matrix).any(axis=1)
+        )
+        n_train_excluded = int((~train_valid_mask).sum())
+        if n_train_excluded > 0:
+            print(f"  Training NaN exclusion: {n_train_excluded} utterance(s) dropped")
+        train_scores_matrix = train_scores_matrix[train_valid_mask]
+        train_sisdr_matrix  = train_sisdr_matrix[train_valid_mask]
+        print(f"  Retained for t-fitting: {train_scores_matrix.shape[0]} training utterances")
+
+        print(f"Fitting t(tau) on training data over {len(tau_grid)} tau grid points ...")
+        t_grid = fit_t_grid_from_training(
+            train_scores_matrix, train_sisdr_matrix, tau_grid,
+            delta=args.delta, loss_bound=loss_bound, risk_mode=args.risk_mode,
+        )
+        print(f"  t(tau) range: [{t_grid.min():.4f}, {t_grid.max():.4f}]  mean={t_grid.mean():.4f}")
+        t_grid_path = os.path.join(args.out_dir, "t_grid_from_training.csv")
+        pd.DataFrame({"tau": tau_grid, "t_frozen": t_grid}).to_csv(t_grid_path, index=False)
+        print(f"  Saved: {t_grid_path}")
+        print("  t is now FROZEN for all calibration/test splits below -- only tau will be calibrated.")
+
     # SPP-best SI-SDR (CRC reference)
     best_score_idx_all = np.nanargmax(scores_matrix, axis=1)
     m_spp_best_all     = sisdr_matrix[np.arange(n_utts), best_score_idx_all]
@@ -1392,7 +1381,7 @@ def main():
     if args.epsilons is not None:
         epsilons = sorted(args.epsilons)
         print(f"\nEpsilon sweep over {epsilons} ...")
-        sweep_df, all_records, sisdr_sweep_df = run_epsilon_sweep(
+        sweep_df, all_records, sisdr_sweep_df, tau_sweep_df = run_epsilon_sweep(
             scores_matrix, sisdr_matrix, utt_ids, tau_grid,
             epsilons=epsilons,
             delta=args.delta,
@@ -1401,6 +1390,7 @@ def main():
             calib_frac=args.calib_frac,
             seed=args.seed,
             risk_mode=args.risk_mode,
+            t_grid=t_grid,
         )
 
         sweep_path = os.path.join(args.out_dir, "crc_spp_ref_cvar_risk_epsilon_sweep.csv")
@@ -1446,8 +1436,6 @@ def main():
         if not args.no_plot:
             plot_dir = os.path.join(args.out_dir, "plots")
             os.makedirs(plot_dir, exist_ok=True)
-            plot_epsilon_sweep(sweep_df, os.path.join(plot_dir, "epsilon_sweep.png"),
-                               delta=args.delta, sisdr_df=sisdr_sweep_df)
             make_sisdr_plots(sisdr_sweep_df, plot_dir)
             dataset_label = os.path.basename(os.path.normpath(args.out_dir))
             plot_epsilon_sweep_risk_vs_attempts(
@@ -1457,11 +1445,11 @@ def main():
                 delta=args.delta,
                 dataset_label=dataset_label,
             )
-            plot_cvar_alpha_sweep(
-                sweep_df,
-                os.path.join(plot_dir, "cvar_alpha_sweep.png"),
-                delta=args.delta,
-            )
+            # tau_sweep_df doesn't depend on epsilon, so it's captured once
+            # from the first split_idx=0 run above and reused here.
+            plot_tau_sweep(tau_sweep_df,
+                           os.path.join(plot_dir, "tau_sweep.png"),
+                           args.delta)
             print(f"Saved plots to {plot_dir}/")
 
         print("\nDone.")
@@ -1481,6 +1469,7 @@ def main():
         calib_frac=args.calib_frac,
         seed=args.seed,
         risk_mode=args.risk_mode,
+        t_grid=t_grid,
     )
 
     splits_path    = os.path.join(args.out_dir, "crc_spp_ref_cvar_risk_splits.csv")
@@ -1526,7 +1515,7 @@ def main():
                               args.epsilon, args.delta)
         plot_tau_sweep(tau_sweep_df,
                        os.path.join(plot_dir, "tau_sweep.png"),
-                       args.epsilon, args.delta)
+                       args.delta)
         print(f"Saved plots to {plot_dir}/")
 
     print("\nDone.")
@@ -1534,3 +1523,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

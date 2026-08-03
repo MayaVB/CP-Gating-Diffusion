@@ -109,6 +109,7 @@ def compute_cvar(
     delta: float,
     B: float,
     t_bounds: Optional[tuple] = None,
+    t_fixed: Optional[float] = None,
 ) -> tuple:
     """
     CVaR_delta^+(tau): finite-sample conformal upper confidence bound on
@@ -133,15 +134,27 @@ def compute_cvar(
                   worst 10% of losses"
         B:        essential upper bound of the loss (known constant)
         t_bounds: optional (lo, hi) bounds to search t over; default (0, B)
+        t_fixed:  optional float -- if given, SKIPS the inner minimization
+                  and simply evaluates h(t_fixed). Used to freeze t at a
+                  value fit externally (e.g. on a separate, non-exchangeable
+                  training split -- see fit_t_grid) instead of re-optimizing
+                  it jointly with each (tau, calibration-sample) pair. This
+                  still returns a valid, if not tightest, upper bound on
+                  CVaR_delta[L(tau)]: h(t) >= min_t h(t) for ANY t by
+                  construction of the R-U representation, so fixing t away
+                  from its minimizer only makes the bound more conservative,
+                  never invalid.
 
     Returns:
-        cvar_plus : float, CVaR_delta^+(tau) -- the calibrated finite-sample
-                    CVaR upper confidence bound (>= the empirical CVaR)
-        t_star    : float, the minimizing auxiliary variable
+        cvar_plus : float, CVaR_delta^+(tau) if t_fixed is None, else h(t_fixed)
+                    -- the calibrated finite-sample CVaR upper confidence
+                    bound (>= the empirical CVaR either way)
+        t_star    : float, the minimizing auxiliary variable, or t_fixed if given
 
     Raises:
-        ValueError: if delta is not in (0, 1), B <= 0, or any loss falls
-                    outside [0, B] (up to a 1e-12 floating-point tolerance).
+        ValueError: if delta is not in (0, 1), B <= 0, any loss falls
+                    outside [0, B] (up to a 1e-12 floating-point tolerance),
+                    or t_fixed falls outside the search bounds.
     """
     if not (0.0 < delta < 1.0):
         raise ValueError(f"delta must be in (0, 1), got {delta}")
@@ -161,8 +174,59 @@ def compute_cvar(
             max(0.0, B - t) + np.sum(np.maximum(0.0, losses - t))
         ) / ((1.0 - delta) * (n + 1))
 
+    if t_fixed is not None:
+        if not (lo - 1e-9 <= t_fixed <= hi + 1e-9):
+            raise ValueError(f"t_fixed={t_fixed} outside search bounds [{lo}, {hi}]")
+        return float(h(t_fixed)), float(t_fixed)
+
     res = minimize_scalar(h, bounds=(lo, hi), method="bounded")
     return float(res.fun), float(res.x)
+
+
+def fit_t_grid(
+    tau_grid: np.ndarray,
+    loss_fn: Callable[[float], tuple],
+    delta: float,
+    B: float = 1.0,
+) -> np.ndarray:
+    """
+    Fit the R-U auxiliary variable t independently, per tau, on a TRAINING
+    sample -- statistically separate from, and prior to, the conformal
+    calibration/test-split procedure in calibrate_cvar_tau.
+
+    For each tau, solves the same inner minimization as compute_cvar
+    (min_t h(t), using loss_fn(tau)'s TRAINING losses), keeping only t_star
+    -- there is no feasibility check or tau selection here. The resulting
+    array is meant to be passed as `t_grid` to calibrate_cvar_tau, which
+    will then evaluate h at these FROZEN t values on a separate (exchangeable)
+    calibration sample instead of re-optimizing t there.
+
+    This keeps parameter fitting (t, on a training split that need not be
+    exchangeable with the deployment distribution) and conformal calibration
+    (tau, on an exchangeable calibration/test split) statistically separate:
+    t is no longer a function of the calibration sample, so freezing it can't
+    leak calibration-sample information into tau's selection, while the
+    result remains a valid (if possibly looser) upper bound on
+    CVaR_delta[L(tau)] by the R-U inequality (h(t) >= min_t h(t) for any t).
+
+    Args:
+        tau_grid: candidate thresholds, ascending -- must be the SAME grid
+                  later passed to calibrate_cvar_tau for calibration
+        loss_fn:  callable tau -> (losses, mean_attempts), evaluated on
+                  TRAINING data (same signature as in calibrate_cvar_tau)
+        delta:    CVaR quantile level
+        B:        essential upper bound of the per-example loss
+
+    Returns:
+        t_grid : (len(tau_grid),) array of t_star(tau), aligned index-for-
+                 index with tau_grid.
+    """
+    t_values = []
+    for tau in tau_grid:
+        losses, _ = loss_fn(tau)
+        _, t_star = compute_cvar(losses, delta=delta, B=B)
+        t_values.append(t_star)
+    return np.asarray(t_values, dtype=float)
 
 
 def calibrate_cvar_tau(
@@ -171,6 +235,7 @@ def calibrate_cvar_tau(
     alpha: float,
     delta: float,
     B: float = 1.0,
+    t_grid: Optional[np.ndarray] = None,
 ):
     """
     Sweep tau_grid and select tau via CVaR-based post-hoc conformal
@@ -212,6 +277,12 @@ def calibrate_cvar_tau(
         alpha:    risk threshold; tau is "feasible" when C_mono(tau) <= alpha
         delta:    CVaR quantile level
         B:        essential upper bound of the per-example loss
+        t_grid:   optional (len(tau_grid),) array -- when given, t is FROZEN
+                  at t_grid[i] for tau_grid[i] instead of being optimized
+                  jointly with this loss_fn's calibration sample (see
+                  fit_t_grid). Use this to fit t once on a separate training
+                  split and keep this calibration step statistically
+                  independent of that fit.
 
     Returns:
         tau_star  : selected threshold
@@ -227,18 +298,25 @@ def calibrate_cvar_tau(
                     is their difference (>= 0); feasible is decided from
                     cvar_hat_monotonized)
     """
+    if t_grid is not None and len(t_grid) != len(tau_grid):
+        raise ValueError(
+            f"t_grid length {len(t_grid)} != tau_grid length {len(tau_grid)}"
+        )
+
     # --- STEP 1: sweep tau, stash the raw per-tau CVaR statistic only. Do
     # NOT decide feasibility yet -- it depends on the monotonized curve,
     # which needs every tau's raw statistic to be computed first. ---
     rows = []
-    for tau in tau_grid:
+    for i, tau in enumerate(tau_grid):
         losses, mean_attempts = loss_fn(tau)
-        cvar_hat_raw, t_star = compute_cvar(losses, delta=delta, B=B)
+        t_fixed = None if t_grid is None else float(t_grid[i])
+        cvar_hat_raw, t_star = compute_cvar(losses, delta=delta, B=B, t_fixed=t_fixed)
         rows.append({
             "tau":               float(tau),
             "mean_loss_cal":     float(np.mean(losses)),
             "cvar_hat_raw":      cvar_hat_raw,
             "t_star":            t_star,
+            "t_frozen":          t_fixed is not None,
             "mean_attempts_cal": float(mean_attempts),
         })
 
