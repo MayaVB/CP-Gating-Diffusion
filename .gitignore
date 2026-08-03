@@ -27,6 +27,7 @@ ms_snsd_libri_nonstat_m3063/
 libri-wham-focus/
 libri-chime-focus/
 crc_results/
+CRC/unused
 
 ### Emacs ###
 # -*- mode: gitignore; -*-
