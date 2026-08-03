@@ -37,10 +37,9 @@ Importantly, the method does not modify the internal diffusion process or reduce
 
 ## Repository Structure
 
-```text
+```
 CRC/
-    crc_spp_reference.py          # Mean-risk CRC calibration
-    crc_spp_reference_cvar.py     # CVaR-CORC calibration (main script)
+    crc_spp_reference_cvar.py     # CVaR-CORC calibration
     cvar_crc.py                   # Generic CVaR calibration routines
 
 enhancement.py
@@ -105,36 +104,8 @@ If no attempt satisfies the threshold, the policy uses the complete attempt budg
 
 ---
 
-## Mean-Risk CRC Calibration
 
-Run:
-
-```bash
-cd CRC
-
-python crc_spp_reference.py \
-    --scores_csv scores.csv \
-    --metrics_csv metrics.csv \
-    --epsilon 0.10
-```
-
-This computes a calibrated threshold:
-
-```text
-tau*
-```
-
-that satisfies the specified mean-risk constraint.
-
-The resulting threshold can then be supplied to `enhancement.py` using:
-
-```text
---crc_tau <tau*>
-```
-
----
-
-## CVaR-Conformal Calibration
+## Calibration
 
 Run:
 
