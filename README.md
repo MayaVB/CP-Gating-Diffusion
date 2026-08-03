@@ -1,6 +1,6 @@
-# Adaptive Compute Allocation for Diffusion-Based Speech Enhancement with Conformal Risk Control
+# Risk-Controlled Adaptive Compute Allocation for Diffusion Speech Enhancement
 
-Official implementation accompanying our work on adaptive diffusion inference using **Conformal Risk Control (CRC)** and **CVaR-Conformal Risk Control (CVaR-CORC)**.
+Official implementation accompanying our work on adaptive diffusion inference using **CVaR-Conformal Risk Control**.
 
 The method reduces the average number of diffusion samples generated during inference while providing statistical guarantees on enhancement quality degradation relative to a reference policy.
 
@@ -177,6 +177,6 @@ as well as the original SGMSE paper.
 
 --- -->
 
-## Acknowledgements
+<!-- ## Acknowledgements
 
-This repository is based on the official SGMSE implementation.
+This repository is based on the official SGMSE implementation. -->
