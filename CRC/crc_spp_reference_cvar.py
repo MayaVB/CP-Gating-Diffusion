@@ -332,16 +332,22 @@ def compute_sisdr_risk(
         R = [m* - m_τ]₊ / (|m*| + ε)
     "raw": no floor, no clip — pure signed risk:
         R = (m* - m_τ) / (|m*| + ε)
+    "clean": no floor, no clip — same formula as "raw":
+        R = (m* - m_τ) / (|m*| + ε)
+        Distinct name because it is the mode wired for the CVaR-CORC path:
+        main() lets B default to 1.0 for it and passes allow_unbounded=True
+        so the finite-sample CVaR bound accepts the signed / above-1 loss
+        (B is then kept only for the (n+1)-augmentation term).
 
     [·]₊ = max(·, 0) ensures negative gaps (early stop beats SPP-best) map to 0.
 
     m_ref     = SI-SDR of SPP-best sample (k* = argmax_k s_k).
     m_selected = SI-SDR of early-stopping selected sample.
     """
-    if risk_mode not in ("clipped", "floor_only", "raw"):
+    if risk_mode not in ("clipped", "floor_only", "raw", "clean"):
         raise ValueError(f"Unknown risk_mode: {risk_mode!r}")
     diff = m_ref - m_selected
-    numerator = diff if risk_mode == "raw" else np.maximum(0.0, diff)
+    numerator = diff if risk_mode in ("raw", "clean") else np.maximum(0.0, diff)
     risk = numerator / (np.abs(m_ref) + eps)
     if risk_mode == "clipped":
         risk = np.clip(risk, 0.0, 1.0)
@@ -414,7 +420,8 @@ def calibrate_tau_crc_cvar(
         return risk, float(attempts.mean())
 
     tau_star, cvar_star, rows = calibrate_cvar_tau(
-        tau_grid, loss_fn, alpha=epsilon, delta=delta, B=loss_bound, t_grid=t_grid
+        tau_grid, loss_fn, alpha=epsilon, delta=delta, B=loss_bound, t_grid=t_grid,
+        allow_unbounded=(risk_mode == "clean"),
     )
     sweep_df = pd.DataFrame(rows)
     return tau_star, cvar_star, sweep_df
@@ -447,7 +454,10 @@ def fit_t_grid_from_training(
         risk  = compute_sisdr_risk(m_ref, m_tau, risk_mode=risk_mode)
         return risk, float(attempts.mean())
 
-    return fit_t_grid(tau_grid, loss_fn, delta=delta, B=loss_bound)
+    return fit_t_grid(
+        tau_grid, loss_fn, delta=delta, B=loss_bound,
+        allow_unbounded=(risk_mode == "clean"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1135,7 +1145,7 @@ def parse_args():
     p.add_argument("--tau_max",    type=float, default=None)
     p.add_argument("--tau_steps",  type=int,   default=200)
     p.add_argument("--no_plot",    action="store_true")
-    p.add_argument("--risk_mode",  choices=["clipped", "floor_only", "raw"], default="clipped",
+    p.add_argument("--risk_mode",  choices=["clipped", "floor_only", "raw", "clean"], default="clipped",
                    help=(
                        "SPP-reference risk formula. 'clipped' (default): "
                        "clip[0,1](max(0, m_ref - m_selected) / (|m_ref| + eps)) "
@@ -1143,7 +1153,11 @@ def parse_args():
                        "(also the only mode with a known essential bound, B=1). "
                        "'floor_only': max(0, m_ref - m_selected) / (|m_ref| + eps), "
                        "no upper clip. 'raw': (m_ref - m_selected) / (|m_ref| + eps), "
-                       "no floor and no clip. Non-'clipped' modes require --loss_bound."
+                       "no floor and no clip (requires --loss_bound; NOT wired for the "
+                       "CVaR path). 'clean': same formula as 'raw' but wired for "
+                       "CVaR-CORC — B defaults to 1.0 and the finite-sample bound "
+                       "accepts the signed / above-1 loss (B kept only for the "
+                       "(n+1)-augmentation). 'floor_only'/'raw' require --loss_bound."
                    ))
     p.add_argument("--check_monotonicity", action="store_true",
                    help=(
@@ -1175,14 +1189,24 @@ def main():
         raise ValueError(f"--delta must be in (0, 1), got {args.delta}")
 
     if args.loss_bound is None:
-        if args.risk_mode != "clipped":
+        if args.risk_mode not in ("clipped", "clean"):
             raise ValueError(
                 f"--loss_bound is required when --risk_mode={args.risk_mode!r} "
-                "(only 'clipped' has a known a priori bound, B=1.0)."
+                "(only 'clipped' and 'clean' default to B=1.0)."
             )
         loss_bound = 1.0
     else:
         loss_bound = args.loss_bound
+
+    if args.risk_mode == "clean":
+        print(
+            "\n  [CLEAN LOSS] risk_mode=clean:  L = (m* - m_sel) / (|m*| + eps)\n"
+            "  No [.]_+ floor and no [0,1] clip. L is signed (negative when the\n"
+            "  early-stopped pick beats the SPP-best pick) and not bounded above.\n"
+            f"  The finite-sample CVaR bound keeps B={loss_bound} only for the\n"
+            "  (n+1)-augmentation (allow_unbounded=True); the R-U t-search is\n"
+            "  widened to [min(0, L_min), max(B, L_max)].\n"
+        )
 
     if (args.train_scores_csv is None) != (args.train_metrics_csv is None):
         raise ValueError(

@@ -110,6 +110,7 @@ def compute_cvar(
     B: float,
     t_bounds: Optional[tuple] = None,
     t_fixed: Optional[float] = None,
+    allow_unbounded: bool = False,
 ) -> tuple:
     """
     CVaR_delta^+(tau): finite-sample conformal upper confidence bound on
@@ -144,6 +145,17 @@ def compute_cvar(
                   construction of the R-U representation, so fixing t away
                   from its minimizer only makes the bound more conservative,
                   never invalid.
+        allow_unbounded: if True, do NOT require losses to lie in [0, B].
+                  The loss may then be signed (negative when an early stop
+                  beats the reference) and is not assumed bounded above by B.
+                  Only the (n+1)-augmentation term keeps B (as the
+                  pessimistic fixed value of the unseen test loss); the
+                  R-U t-search is widened to [min(0, L_min), max(B, L_max)].
+                  The finite-sample coverage argument only needs
+                  exchangeability of the (n+1) calibration+test losses plus
+                  a value assigned to the (n+1)-th one, not a two-sided a
+                  priori bound -- see the "clean loss" variant. Default
+                  False reproduces the strict [0, B] behavior exactly.
 
     Returns:
         cvar_plus : float, CVaR_delta^+(tau) if t_fixed is None, else h(t_fixed)
@@ -161,13 +173,21 @@ def compute_cvar(
     if B <= 0:
         raise ValueError(f"B (essential upper bound of the loss) must be > 0, got {B}")
     losses = np.asarray(losses, dtype=float)
-    if np.any(losses < -1e-12) or np.any(losses > B + 1e-12):
+    if not allow_unbounded and (np.any(losses < -1e-12) or np.any(losses > B + 1e-12)):
         raise ValueError(
             f"losses must lie in [0, B] = [0, {B}]; got range "
-            f"[{losses.min()}, {losses.max()}]"
+            f"[{losses.min()}, {losses.max()}]. Pass allow_unbounded=True to "
+            f"permit a signed / above-B loss (the finite-sample bound then "
+            f"keeps B only for the (n+1)-augmentation)."
         )
     n = len(losses)
-    lo, hi = t_bounds if t_bounds is not None else (0.0, B)
+    if t_bounds is not None:
+        lo, hi = t_bounds
+    elif allow_unbounded:
+        lo = min(0.0, float(losses.min()))
+        hi = max(float(B), float(losses.max()))
+    else:
+        lo, hi = 0.0, B
 
     def h(t: float) -> float:
         return t + (
@@ -188,6 +208,7 @@ def fit_t_grid(
     loss_fn: Callable[[float], tuple],
     delta: float,
     B: float = 1.0,
+    allow_unbounded: bool = False,
 ) -> np.ndarray:
     """
     Fit the R-U auxiliary variable t independently, per tau, on a TRAINING
@@ -224,7 +245,9 @@ def fit_t_grid(
     t_values = []
     for tau in tau_grid:
         losses, _ = loss_fn(tau)
-        _, t_star = compute_cvar(losses, delta=delta, B=B)
+        _, t_star = compute_cvar(
+            losses, delta=delta, B=B, allow_unbounded=allow_unbounded
+        )
         t_values.append(t_star)
     return np.asarray(t_values, dtype=float)
 
@@ -236,6 +259,7 @@ def calibrate_cvar_tau(
     delta: float,
     B: float = 1.0,
     t_grid: Optional[np.ndarray] = None,
+    allow_unbounded: bool = False,
 ):
     """
     Sweep tau_grid and select tau via CVaR-based post-hoc conformal
@@ -283,6 +307,10 @@ def calibrate_cvar_tau(
                   fit_t_grid). Use this to fit t once on a separate training
                   split and keep this calibration step statistically
                   independent of that fit.
+        allow_unbounded: forwarded to compute_cvar -- if True, the per-tau
+                  losses need not lie in [0, B] (signed / above-B loss
+                  allowed; B kept only for the (n+1)-augmentation). Default
+                  False keeps the strict [0, B] check.
 
     Returns:
         tau_star  : selected threshold
@@ -310,7 +338,9 @@ def calibrate_cvar_tau(
     for i, tau in enumerate(tau_grid):
         losses, mean_attempts = loss_fn(tau)
         t_fixed = None if t_grid is None else float(t_grid[i])
-        cvar_hat_raw, t_star = compute_cvar(losses, delta=delta, B=B, t_fixed=t_fixed)
+        cvar_hat_raw, t_star = compute_cvar(
+            losses, delta=delta, B=B, t_fixed=t_fixed, allow_unbounded=allow_unbounded
+        )
         rows.append({
             "tau":               float(tau),
             "mean_loss_cal":     float(np.mean(losses)),
